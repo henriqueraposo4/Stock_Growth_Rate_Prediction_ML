@@ -1,0 +1,1288 @@
+---
+title: "Stock Growth Rate Prediction Code"
+author: "Henrique Raposo"
+date: "25 September 2024"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Set up
+
+```{r}
+# install.packages("caret")
+# install.packages("lubridate")
+# install.packages("Metrics")
+# install.packages("naniar")
+# install.packages("randomForest")
+# install.packages("splitstackshape")
+# install.packages("xgboost")
+# install.packages("SHAPforxgboost")
+
+
+#load necessary libraries
+library(ggplot2) # Load ggplot2 for visualizations
+library(naniar) # Load nanair for missing data visualization
+library(dplyr)
+library(tidyr)
+library(lubridate)
+library(zoo)
+library(data.table)
+library(randomForest) # Load randomForest package to run bagging
+library(caret) # Used for analysing results
+library(splitstackshape) # Used for stratified sampling
+library(xgboost) # Load XGBoost
+library(SHAPforxgboost) # Load shap for XGBoost
+library(Metrics)
+source("a_insights_shap_functions.r")
+```
+
+## Load data
+
+```{r}
+#load the data
+financial_information <- read.csv("russell_1000_financial_information")
+historical_prices <- read.csv("russell_1000_historical_price")
+
+```
+
+## Data Cleaning
+
+```{r}
+#check financial info data
+dim(financial_information) # Check dimensions of dataset
+head(financial_information) # View head of dataset (First rows)
+tail(financial_information) # View tail of dataset (Last rows)
+nrow(unique(financial_information)) # Check unique rows in dataset
+str(financial_information)
+#from this we see that columns that should be numeric class, are actually chr
+```
+
+```{r}
+dim(historical_prices) # Check dimensions of dataset
+head(historical_prices) # View head of dataset (First rows)
+tail(historical_prices) # View tail of dataset (Last rows)
+nrow(unique(historical_prices)) # Check unique rows in dataset
+str(historical_prices)
+```
+
+```{r}
+#the financial information table has N/A values, however, they are saved as text instead of true NA
+#replace "N/A" with NA
+financial_information[financial_information=="N/A"] <- NA
+
+#transform all metric columns into numeric class
+#get all column names
+colum_names_fin_info <- colnames(financial_information)
+
+#remove columns that should be charc
+columns_no_change <- c("Ticker","longName","Industry","Sector","Recommendation.Key")
+colum_names_fin_info <- setdiff(colum_names_fin_info, columns_no_change)
+
+#change columns to numeric
+for (col in colum_names_fin_info) {
+  financial_information[[col]] <- as.numeric(financial_information[[col]])
+}
+
+```
+
+```{r}
+summary(financial_information)
+
+#check number of NA
+sum(is.na(financial_information)) #1628 NA
+
+#columns are now in the correct class, so let us deal with the NA
+```
+
+
+```{r}
+#Lets look at the distribution of missing values
+feat_vars <- names(financial_information)
+# Select only columns with NA values, this is done to make the graph more readable
+feat_vars_with_na <- feat_vars[colSums(is.na(financial_information[, feat_vars])) > 0]
+
+# Visualize missing data in the selected columns
+vis_miss(financial_information[, feat_vars_with_na])
+#Dividend related column seems to be the biggest issue
+```
+
+
+```{r}
+#Let us look at Dividend Yield columns NA
+
+financial_information[is.na(financial_information$Dividend.Rate),]
+#After some research, we notice that the NA here is not missing value but that no dividends are being payed
+
+#Thus, if the dividend rate or yield or 5 year avg is NA is because the company does not pay dividends, hence NA will be substitute to 0
+dividend_cols <- c("Dividend.Rate", "Dividend.Yield", "X5.Year.Avg.Dividend.Yield")
+financial_information[dividend_cols][is.na(financial_information[dividend_cols])] <- 0
+
+
+```
+
+
+```{r}
+#check number of NA
+sum(is.na(financial_information)) #641 NA
+
+#Let us look at Trailing PE columns NA
+financial_information[is.na(financial_information$Trailing.P.E),]
+
+#a lot of trailing PE is missing which would will impact our data as it is about 14% of the data
+
+#the metric measures PE from the previous 12 months while forward PE is the based on the projected PE. To avoid losing data and keep some of the financial info we can drop the trailing PE column and instead calculate the current PE and use that as the metric
+
+#drop trailing PE column
+financial_information_no_trail_pe <- financial_information[-12]
+
+
+#calculate PE
+#PE is stock price/ earnings per share
+
+financial_information_no_trail_pe$Price.to.Earnings <- ifelse(financial_information_no_trail_pe$Earnings.Per.Share != 0, 
+                                                      financial_information_no_trail_pe$Stock.Price/ financial_information_no_trail_pe$Earnings.Per.Share,NA)
+  
+
+
+#let us look at NA value
+financial_information_no_trail_pe[is.na(financial_information_no_trail_pe$Price.to.Earnings),]
+#there is only one company with NA due to earning per share being 0
+
+```
+
+
+```{r}
+#Let us look at EBITDA columns NA
+financial_information_no_trail_pe[is.na(financial_information_no_trail_pe$EBITDA),]
+
+#with further research, we can assume that those are true NA values, moreover it does not make sense to apply mice as each company is significantly different from one another and have different operating strategies. Thus, we will drop those values
+
+adj_financial_info <- financial_information_no_trail_pe[!is.na(financial_information_no_trail_pe$EBITDA), ]
+
+
+```
+
+
+
+```{r}
+#Let us look at Debt to Equity and Return on Equity
+adj_financial_info[is.na(adj_financial_info$Debt.to.Equity),]
+adj_financial_info[is.na(adj_financial_info$Return.on.Equity),]
+#From research, we see those are true NA values, hence we will drop then
+
+#Moreover, all the other columns with NA do not make sense to be 0, hence we will drop those NA
+clean_financial_info <- na.omit(adj_financial_info)
+
+```
+
+
+```{r}
+#As a result of removing NA...
+dim(clean_financial_info)
+summary(clean_financial_info)
+#unfortunately, we lost about 17% of the data, however, it does not make sense fill those NA with either the mean of the metric or using mice 
+
+```
+
+```{r}
+#As we eliminated some stock due to NA values, we need to make this adjustment in the historical price table. 
+
+#Get tickers used
+tickers <- clean_financial_info$Ticker
+#Add date column
+tickers <- c(tickers, "Date")
+
+#filter historical price table
+adj_historical_prices <- historical_prices[, colnames(historical_prices) %in% tickers]
+
+```
+
+
+```{r}
+#checking for NA values 
+sum(is.na(adj_historical_prices)) #5575 NA
+na_per_colum <- colSums(is.na(adj_historical_prices))
+na_per_colum[na_per_colum > 0]
+
+#only two stocks have NA values
+
+#we will exclude these stocks from our analysis, as it is a very small number of samples with NA 
+ticker_to_exclude <- c("CR","SW")
+final_financial_info <- clean_financial_info[!(clean_financial_info$Ticker %in% ticker_to_exclude),]
+final_historical_price <- adj_historical_prices[, !colnames(adj_historical_prices) %in% ticker_to_exclude]
+
+```
+
+```{r}
+dim(final_financial_info)
+dim(final_historical_price)
+#both have the same amount of ticker and the data is ready for analysis (hist price has an extra column for the date)
+
+```
+
+## Adding new metrics  
+
+```{r}
+#for our response variable, we will use the growth rate of the next 10 weeks "in the future". Thus our base date is the from from 10 weeks ago. We will use that to calculate growth rate where the price from 10 weeks ago is the previous price and the current price is the most recent price. However, for the metrics we will only use data from the date of 10 weeks ago and dates before that. This way, the response variable is the actual growth rate the prices had
+
+
+#current price = most recent price
+#previous price = 10 weeks ago
+
+#growth rate = (current price - previous price)/previous price * 100
+
+#Calculate necessary dates
+start_date <- as.Date("2024-09-24")
+date_10_weeks_before <- start_date - 70 #7 days * 10 weeks
+
+current_price <- final_historical_price[final_historical_price$Date == start_date,]
+previous_price <- final_historical_price[final_historical_price$Date == date_10_weeks_before,]
+
+#remove date column
+current_price <- current_price[,-1]
+previous_price<- previous_price[,-1]
+
+#calculate growth rate
+growth_rate <- (current_price - previous_price) / previous_price * 100
+
+#reshape the data
+growth_rates_vector <- as.numeric(growth_rate)
+growth_data <- data.frame(Ticker = names(growth_rate), GrowthRate = growth_rates_vector)
+growth_data
+
+```
+
+
+
+```{r}
+#Let us get some time series feature that will be used in the models
+
+# Here we will use the price from 10 weeks ago to act as the current price
+filtered_hist_price <- final_historical_price[final_historical_price$Date <= date_10_weeks_before,]
+
+
+#Let us start with Price Change
+
+
+#create function to calculate the price changes for different periods
+calculate_price_change <- function(weeks) {
+      
+      # Convert weeks to numeric
+      weeks <- as.numeric(weeks)
+      
+      # Find the most recent date in the data
+      latest_date <- max(filtered_hist_price[["Date"]])
+      latest_date <- as.Date(latest_date)
+      
+      # Calculate the date that is X weeks before the latest date
+      date_x_weeks_before <- latest_date - (weeks*7)
+      
+      # Filter the data for the latest date and the date X weeks before
+      df_latest <- filtered_hist_price[filtered_hist_price[["Date"]] == latest_date, ]
+      df_x_weeks_before <- filtered_hist_price[filtered_hist_price[["Date"]] == date_x_weeks_before, ]
+      
+      # Calculate price change
+      price_change <- (df_latest[-1] - df_x_weeks_before[-1]) / df_x_weeks_before[-1] * 100
+      
+      # Reshape the data
+      price_change_vector <- as.numeric(price_change)
+      column_name <- paste("wk_price_change", weeks, sep="_")
+      
+      result <- setNames(data.frame(Ticker = names(price_change), 
+                                     PriceChange = price_change_vector), 
+                         c("Ticker", column_name))
+      
+      return(result) }
+
+
+
+#calculate the price change for up to 52 weeks
+price_changes <- list()
+
+for (weeks in seq(4, 52, by = 4)) {
+  # Create the price change using the function
+  price_changes[[paste(weeks, "wk_price_change", sep = "_")]] <- calculate_price_change(weeks)
+}
+
+#combine all price changes in one Data Frame
+complete_price_changes <- Reduce(function(x, y) merge(x, y, by = "Ticker", all = TRUE), price_changes)
+complete_price_changes
+
+
+```
+
+
+```{r}
+#Now, we will calculate the Ratios of Price Change
+
+#for this we will calculate the ratio of the change of price between every 4 weeks using the price change previously calculated
+#ex: ratio of change = week 4/ week 8
+
+# Loop through the weeks and calculate the rate of change
+for (i in seq(4, 48, by = 4)) {
+  #get the first week
+  current_week <- paste0("wk_price_change_", i)
+  #get following week
+  next_week <- paste0("wk_price_change_", i + 4)
+  #name for new column
+  rate_of_change_column <- paste0("rate_of_change_",i, "_", i + 4)
+  
+  complete_price_changes[[rate_of_change_column]] <- complete_price_changes[[current_week]] / complete_price_changes[[next_week]]
+}
+
+summary(complete_price_changes)
+
+```
+
+```{r}
+#We see that 4_8 and 16_20 rate of change have infinite values, let us investigate
+
+# Filter rows where the 'rate_of_change_16_20' column has infinite values
+infinite_rows <- complete_price_changes[is.infinite(complete_price_changes[["rate_of_change_16_20"]]), ]
+infinite_rows
+
+week = 20
+
+# Find the most recent date in the data
+      latest_date <- max(filtered_hist_price[["Date"]])
+      latest_date <- as.Date(latest_date)
+      
+      # Calculate the date that is X weeks before the latest date
+      date_x_weeks_before <- latest_date - (week*7)
+
+      
+       # Filter the data for the latest date and the date X weeks before
+      df_latest <- filtered_hist_price[filtered_hist_price[["Date"]] == latest_date, ]
+      df_x_weeks_before <- filtered_hist_price[filtered_hist_price[["Date"]] == date_x_weeks_before, ]
+      
+      df_latest$SWN
+      df_x_weeks_before$SWN
+      
+# Filter rows where the 'rate_of_change_4_8' column has infinite values
+infinite_rows <- complete_price_changes[is.infinite(complete_price_changes[["rate_of_change_4_8"]]), ]
+infinite_rows
+
+
+week = 8
+
+# Find the most recent date in the data
+      latest_date <- max(filtered_hist_price[["Date"]])
+      latest_date <- as.Date(latest_date)
+      
+      # Calculate the date that is X weeks before the latest date
+      date_x_weeks_before <- latest_date - (week*7)
+
+      
+       # Filter the data for the latest date and the date X weeks before
+      df_latest <- filtered_hist_price[filtered_hist_price[["Date"]] == latest_date, ]
+      df_x_weeks_before <- filtered_hist_price[filtered_hist_price[["Date"]] == date_x_weeks_before, ]
+      
+      df_latest$AMCR
+      df_x_weeks_before$AMCR
+      
+      df_latest$CERT
+      df_x_weeks_before$CERT
+      
+      
+# The infinite values are from the price change being 0 as the price of stock is exactly the same. Thus, there is infinite growth or decay.
+# We cannot let the infinite values be as it will affect the models, however, there is not a substitute either as it is mathematically undefined. As these are only 3 stocks that had the exact same price by pure chance it is better to just drop these stocks
+      
+#We will not exclude now as it is easier to just drop when everything is merged, but let us save them for now
+tickers_to_exclude <- c("SWN","AMCR","CERT")
+
+```
+
+
+```{r}
+#Range of Movement is next
+
+#to measure the range of movement to find volatility which can help in identifying outliers we will use the standard deviation 
+
+# Function to filter based on weeks and calculate standard deviation
+calculate_sd_for_weeks <- function(weeks) {
+      
+      # Find the most recent date in the data
+      latest_date <- max(filtered_hist_price[["Date"]])
+      latest_date <- as.Date(latest_date)
+      
+      # Calculate the date that is X weeks before the latest date
+      date_x_weeks_before <- latest_date - (weeks*7)
+      
+      # Filter data to include only dates from the specified number of weeks 
+      filtered_dates <-filtered_hist_price %>% filter(filtered_hist_price[[1]] >= date_x_weeks_before)
+      
+      # Exclude the first column (date column) and keep only the stock price data
+      numeric_data <- filtered_dates[, -1]
+        
+      # Calculate standard deviation for each column (each stock)
+      stock_sd <- apply(numeric_data, 2,sd)
+      
+      # Create a data frame for the results
+      sd_df <- data.frame(
+        Ticker = names(stock_sd),
+        Week_Sd = stock_sd,
+        stringsAsFactors = FALSE
+      )
+      
+      # Rename the column to reflect the week number
+      colnames(sd_df)[2] <- paste0("wk_sd_", weeks)
+      
+      return(sd_df)
+}
+
+
+# Define the range of weeks (every 4 weeks up to 52)
+week_range <- seq(4, 52, by = 4)
+
+#find total number of weeks in the data
+head(filtered_hist_price)
+tail(filtered_hist_price)
+
+date1 <- as.Date("2024-07-06")  # First date
+date2 <- as.Date("2022-09-26")  # Second date
+
+# Calculate the difference in weeks
+difference_in_weeks <- as.numeric(difftime(date1, date2, units = "weeks"))
+
+# Add 92 weeks to range
+week_range <- c(week_range, 92)
+
+# Loop to create sd of the weeks
+sd_list <- list()
+for (weeks in week_range) {
+  sd_list[[paste0("sd_", weeks, "_week")]] <- calculate_sd_for_weeks(weeks)
+}
+
+# Convert the list into a data frame
+# sd_df <- do.call(rbind, sd_list)
+# rownames(sd_df) <- colnames(filtered_hist_price[,-1]) #ticker list
+# sd_df <- data.frame(Ticker = rownames(sd_df), sd_df)
+
+
+# Combine all price changes in one Data Frame
+complete_sd <- Reduce(function(x, y) merge(x, y, by = "Ticker", all = TRUE), sd_list)
+complete_sd
+
+```
+
+
+```{r}
+#Now let us combine all the new metrics to the financial information data frame
+
+#Merge growth date with price changes metrics
+time_features <- merge(growth_data, complete_price_changes, by="Ticker", all=TRUE)
+
+#Add sd metric
+time_features <- merge(time_features, complete_sd, by = "Ticker", all=TRUE)
+
+#Combine time features to financial info
+all_stock_info <- merge(final_financial_info, time_features, by = "Ticker", all = TRUE)
+
+#Exclude the stocks that had infinite value
+all_stock_info<- all_stock_info %>% filter(!Ticker %in% tickers_to_exclude)
+
+dim(all_stock_info)
+sum(is.na(all_stock_info))
+
+#all stocks are here and no NA values, meaning we are ready to start modeling 
+
+```
+
+## Initial Vizualizations
+
+
+```{r}
+#density plot of growth rate
+g_1 <- ggplot(growth_data, aes(x = GrowthRate)) + # Set X-axis as the log of insurance charges
+  geom_density(fill = "darkblue", alpha = 0.3) + # Use geom_density to get density plot
+  theme_bw() + # Set theme for plot
+  theme(panel.grid.major = element_blank(), # Turn of the background grid
+        panel.grid.minor = element_blank(),
+        panel.border = element_blank(),
+        panel.background = element_blank()) +
+  labs(x = "Growth Rate", # Set plot labels
+       title = "Density plot of Growth Rate",)
+
+g_1 # Generate plot
+
+```
+
+
+```{r}
+
+#Create a function to create scatter plot of two variables 
+
+scatter_plot <- function(data, y_var, x_var, plot_title, y_lab, x_lab) {
+    ggplot(data, aes_string(x = x_var, y = y_var)) + 
+    geom_point(color = "blue", alpha = 0.3) + 
+    geom_smooth(method = "lm") + 
+    theme_bw() + 
+    theme(panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(),
+          panel.border = element_blank(),
+          panel.background = element_blank()) + 
+    labs(y = y_lab, 
+         x = x_lab, 
+         title = plot_title)
+}
+
+```
+
+```{r}
+#Visualization of possible correlations
+scatter_plot(all_stock_info, "GrowthRate", "Dividend.Rate", "Growth Rate vs Dividend Rate", "Growth Rate", "Dividend Rate")
+scatter_plot(all_stock_info, "GrowthRate", "Payout.Ratio", "Growth Rate vs Payout Ratio", "Growth Rate", "Payout Ratio")
+scatter_plot(all_stock_info, "GrowthRate", "EBITDA", "Growth Rate vs EBITDA", "Growth Rate", "EBITDA")
+scatter_plot(all_stock_info, "GrowthRate", "Earnings.Per.Share", "Growth Rate vs Earnings Per Share", "Growth Rate", "Earnings Per Share")
+```
+
+## Models
+
+We will attempt three models: Linear Regression, Random Forest and XGBoost
+
+```{r}
+#Prepaing the data
+
+#we will save a copy of the table to use it later when comparing results
+unmodified_stock_info <- all_stock_info
+
+#It is unlikely that longName will add any value so let us exclude that as well as Ticker
+all_stock_info <- all_stock_info[,-c(1,2)]
+
+#As we already have an industry column, for simplicity let us exclude the Sector column
+all_stock_info <- all_stock_info[,-3]
+
+# We will also exclude stock price as that is the price from 09/24, in other words, the future price we want to predict
+all_stock_info <- all_stock_info[,-1]
+```
+
+```{r}
+#Let us examine the correlation of the numeric values
+cor(all_stock_info[,-c(1,23)]) #exclude industry and recommendation key
+
+#Regular Market Volume and Volume have perfect correlation
+#We will use Volume and not Regular Market Volume as that counts for Volume outside market hour as well
+all_stock_info <- all_stock_info[,-10]
+```
+
+### Linear Regression
+```{r}
+initital_ln_reg <- lm(GrowthRate ~.,
+             data = all_stock_info)
+
+summary(initital_ln_reg)
+
+```
+
+We have a adj R-squared of 0.3 meaning not all is explained. 
+
+```{r}
+
+# Split the data intro training and test data
+
+set.seed(11111) # Set seed
+
+# Sample train rows
+train_indices <- sample(1:nrow(all_stock_info), size = 0.8 * nrow(all_stock_info))
+
+# Create training and test sets
+train_data <- all_stock_info[train_indices, ]
+test_data <- all_stock_info[-train_indices, ]
+
+# Check the dimensions of the data
+dim(train_data)
+dim(test_data)
+
+# Drop industry as it will impact our linear regression model,if an industry is in the test data but not in the training.
+train_data_no_ind <- train_data[,-1]
+test_data_no_ind <- test_data[,-1]
+
+```
+
+```{r}
+
+#Create model using train data
+final_ln_reg <- lm(GrowthRate ~.,
+             data = train_data_no_ind)
+
+summary(final_ln_reg)
+
+```
+
+```{r}
+# Predict values
+
+ln_reg_pred <- predict(final_ln_reg, test_data_no_ind)
+
+# Calculate RMSE
+rmse_ln_reg <- rmse(test_data_no_ind$GrowthRate, ln_reg_pred)
+rmse_ln_reg
+
+```
+
+
+### Random Forest
+
+
+```{r}
+# We start by tunning ntree
+
+# Define a range of ntree values to test
+ntree_values <- seq(50, 1000, by = 50)  # Adjust the range as needed
+rmse_results <- numeric(length(ntree_values))
+
+# Loop through the ntree values
+for (i in seq_along(ntree_values)) {
+  model <- randomForest(GrowthRate ~ ., 
+                        data = train_data,
+                        ntree = ntree_values[i])
+  
+  # Make predictions
+  predictions <- predict(model, newdata = train_data)
+  
+  # Calculate RMSE
+  rmse <- rmse(train_data$GrowthRate, predictions)
+  
+  # Store results
+  rmse_results[i] <- rmse
+}
+
+# Print results
+results <- data.frame(ntree = ntree_values, RMSE = rmse_results)
+print(results)
+
+# Plot RMSE vs ntree
+plot(results$ntree, results$RMSE, type = "b", 
+     xlab = "Number of Trees (ntree)", ylab = "RMSE", 
+     main = "RMSE vs Number of Trees")
+
+# The RMSE is the lowest at 150 and 800. We will choose 150 to speed up the proccess
+```
+
+```{r}
+# Tunning mtry and node size
+
+
+# Define parameter grids
+mtry_vals <- c(9, 18, 27, 36, 45, 55, 65, 78)
+nodesize_vals <- c(1, 10, 15, 50, 100, 150, 200, 500, 1000)
+
+# Create a grid of parameters to test
+params <- expand.grid(mtry = mtry_vals, nodesize = nodesize_vals)
+
+# Initialize vectors to store RMSE
+rmse_vec <- rep(NA, nrow(params))
+
+# Loop over each combination of parameters
+for (i in 1:nrow(params)) {
+  
+  # Train Random Forest model with specified parameters
+  rf_mod <- randomForest(GrowthRate ~ ., 
+                         data = train_data, 
+                         ntree = 150, 
+                         nodesize = params$nodesize[i], 
+                         mtry = params$mtry[i])
+  
+  # Make predictions on the training data (or on a separate test set)
+  rf_preds <- predict(rf_mod, train_data)  # If you have a separate test set, use it here
+  
+  # Calculate RMSE
+  
+  rmse <- rmse(train_data$GrowthRate, rf_preds)
+    
+  # Store RMSE
+  rmse_vec[i] <- rmse
+  
+}
+
+# Combine results into a data frame for better visualization
+results <- data.frame(params, RMSE = rmse_vec)
+
+# Print results
+print(results)
+```
+
+
+```{r}
+# Let us visualize the parameters and RMSE
+# Assuming you already have `results` data frame from previous code
+res_db <- cbind.data.frame(params, rmse_vec) # Use rmse_vec instead of acc_vec
+res_db$mtry <- as.factor(res_db$mtry) # Convert mtry to factor for plotting
+res_db$nodesize <- as.factor(res_db$nodesize) # Convert nodesize to factor for plotting
+
+# Create heatmap
+g_rmse <- ggplot(res_db, aes(y = mtry, x = nodesize, fill = rmse_vec)) + # Set aesthetics
+  geom_tile() + # Use geom_tile for heatmap
+  theme_bw() + # Set theme
+  scale_fill_gradient2(low = "red", # Choose low color (lower RMSE is better)
+                       mid = "white", # Choose mid color
+                       high = "blue", # Choose high color
+                       midpoint = mean(res_db$rmse_vec), # Choose mid point
+                       space = "Lab", 
+                       na.value = "grey", # Choose NA value
+                       guide = "colourbar", # Set color bar
+                       aesthetics = "fill") + # Select aesthetics to apply
+  labs(x = "Node Size", y = "mtry", fill = "RMSE") + # Set labels
+  ggtitle("Heatmap of RMSE for Different mtry and Node Size Combinations") # Title for the plot
+
+g_rmse # Generate plot
+
+```
+We can clearly see that node size of 1 and 10 is ideal, but to avoid overfitting, we will choose node size of 10 With mtry we have more freedom, however, as we want to filter some of the variables we will use mtry = 27
+
+```{r}
+rf_final_mod <- randomForest(GrowthRate ~., # Set tree formula
+                         data = train_data, # Set dataset
+                         ntree = 250,
+                         nodesize = 10,
+                         mtry = 27) # Set number of trees to use
+
+```
+
+```{r}
+# Make predictions on the test set)
+rf_preds <- predict(rf_final_mod, test_data)  # If you have a separate test set, use it here
+  
+# Calculate RMSE
+rmse <- rmse(test_data$GrowthRate, rf_preds)
+rmse
+```
+
+```{r}
+varImpPlot(rf_final_mod, type =2, n.var = 10) # Plot importance
+```
+
+```{r}
+summary(test_data$GrowthRate)
+```
+
+Given the range of growth is -41 to 33 and RMSE is 12.8 the model predicit somewhat well, but the range is error is quite significant. It is interesting to see that Enterprise to EBITA and Market Cap and strongest predictors, which has high correlation with the size and profitability of a company.
+
+
+### XGBoost
+
+```{r}
+#split the data
+
+# Drop industry and recommendation key as it not numeric. However, this should not affect our model as we have seen from Linear Regression and Random Forest that industry is not a super strong predictor and recommendation key is also represented in recommendation mean
+
+train_data <- train_data[,-c(1, 22)]
+test_data <- test_data[,-c(1,22)]
+
+# Split the features and target variable for training and test data
+x_train <- as.matrix(train_data[, -which(names(train_data) == "GrowthRate")]) # Exclude the target column
+y_train <- train_data$GrowthRate
+
+x_test <- as.matrix(test_data[, -which(names(test_data) == "GrowthRate")]) # Exclude the target column
+y_test <- test_data$GrowthRate
+
+# Convert the data to DMatrix format
+dtrain <- xgb.DMatrix(data = x_train, label = y_train)
+dtest <- xgb.DMatrix(data = x_test, label = y_test)
+
+```
+
+
+```{r}
+# We will start by checking the number of nrounds
+
+set.seed(111111)
+
+# Perform cross-validation to tune the number of rounds
+bst_tune <- xgb.cv(
+  data = dtrain,            # Training data
+  nfold = 5,                # 5-fold cross-validation
+  eta = 0.1,                # Learning rate
+  nrounds = 1000,           # Number of boosting rounds
+  early_stopping_rounds = 50,  # Stop if no improvement for 50 rounds
+  objective = "reg:squarederror",  # Regression objective
+  verbose = 1,              # Print out fit info
+  nthread = 1,              # Number of parallel threads
+  print_every_n = 20        # Print every 20th iteration
+)
+
+# Extract the RMSE values from the cross-validation log
+evaluation_log <- bst_tune$evaluation_log
+
+# Visualize RMSE over rounds
+ggplot(evaluation_log, aes(x = iter, y = test_rmse_mean)) +
+  geom_line(color = "blue") +
+  geom_point(color = "red") +
+  theme_minimal() +
+  labs(title = "RMSE vs Number of Rounds",
+       x = "Number of Rounds (nrounds)",
+       y = "Test RMSE") 
+```
+
+From the graph we see the model learn very fast reaching the minimum RMSE very early on (100). Given this, we will start by tunning the ETA
+
+```{r}
+###### eta tuning ######
+
+# Use xgb.cv to run cross-validation inside xgboost
+set.seed(111111)
+bst_mod_1 <- xgb.cv(data = dtrain, # Set training data
+                    
+                    nfold = 5, # Use 5 fold cross-validation
+                    
+                    eta = 0.3, # Set learning rate
+               
+                    nrounds = 1000, # Set number of rounds
+                    early_stopping_rounds = 50, # Set number of rounds to stop at if there is no improvement
+                    
+                    verbose = 1, # 1 - Prints out fit
+                    nthread = 1, # Set number of parallel threads
+                    print_every_n = 20 # Prints out result every 20th iteration
+) # Set evaluation metric to use
+
+
+set.seed(111111)
+bst_mod_2 <- xgb.cv(data = dtrain, # Set training data
+                    
+                    nfold = 5, # Use 5 fold cross-validation
+                    
+                    eta = 0.1, # Set learning rate
+                   
+                    nrounds = 1000, # Set number of rounds
+                    early_stopping_rounds = 50, # Set number of rounds to stop at if there is no improvement
+                    
+                    verbose = 1, # 1 - Prints out fit
+                    nthread = 1, # Set number of parallel threads
+                    print_every_n = 20 # Prints out result every 20th iteration
+) # Set evaluation metric to use
+
+set.seed(111111)
+bst_mod_3 <- xgb.cv(data = dtrain, # Set training data
+                    
+                    nfold = 5, # Use 5 fold cross-validation
+                    
+                    eta = 0.05, # Set learning rate
+                    
+                    nrounds = 1000, # Set number of rounds
+                    early_stopping_rounds = 50, # Set number of rounds to stop at if there is no improvement
+                    
+                    verbose = 1, # 1 - Prints out fit
+                    nthread = 1, # Set number of parallel threads
+                    print_every_n = 20 # Prints out result every 20th iteration
+) # Set evaluation metric to use
+
+
+set.seed(111111)
+bst_mod_4 <- xgb.cv(data = dtrain, # Set training data
+                    
+                    nfold = 5, # Use 5 fold cross-validation
+                    
+                    eta = 0.01, # Set learning rate
+                   
+                    nrounds = 1000, # Set number of rounds
+                    early_stopping_rounds = 50, # Set number of rounds to stop at if there is no improvement
+                    
+                    verbose = 1, # 1 - Prints out fit
+                    nthread = 1, # Set number of parallel threads
+                    print_every_n = 20 # Prints out result every 20th iteration
+) # Set evaluation metric to use
+
+
+
+set.seed(111111)
+bst_mod_5 <- xgb.cv(data = dtrain, # Set training data
+                    
+                    nfold = 5, # Use 5 fold cross-validation
+                    
+                    eta = 0.005, # Set learning rate
+
+                    nrounds = 1000, # Set number of rounds
+                    early_stopping_rounds = 50, # Set number of rounds to stop at if there is no improvement
+                    
+                    verbose = 1, # 1 - Prints out fit
+                    nthread = 1, # Set number of parallel threads
+                    print_every_n = 20 # Prints out result every 20th iteration
+                    
+) # Set evaluation metric to use
+```
+
+
+```{r}
+# eta plots
+
+# Extract results for model with eta = 0.3
+pd1 <- cbind.data.frame(bst_mod_1$evaluation_log[,c("iter", "test_rmse_mean")], rep(0.3, nrow(bst_mod_1$evaluation_log)))
+names(pd1)[3] <- "eta"
+# Extract results for model with eta = 0.1
+pd2 <- cbind.data.frame(bst_mod_2$evaluation_log[,c("iter", "test_rmse_mean")], rep(0.1, nrow(bst_mod_2$evaluation_log)))
+names(pd2)[3] <- "eta"
+# Extract results for model with eta = 0.05
+pd3 <- cbind.data.frame(bst_mod_3$evaluation_log[,c("iter", "test_rmse_mean")], rep(0.05, nrow(bst_mod_3$evaluation_log)))
+names(pd3)[3] <- "eta"
+# Extract results for model with eta = 0.01
+pd4 <- cbind.data.frame(bst_mod_4$evaluation_log[,c("iter", "test_rmse_mean")], rep(0.01, nrow(bst_mod_4$evaluation_log)))
+names(pd4)[3] <- "eta"
+# Extract results for model with eta = 0.005
+pd5 <- cbind.data.frame(bst_mod_5$evaluation_log[,c("iter", "test_rmse_mean")], rep(0.005, nrow(bst_mod_5$evaluation_log)))
+names(pd5)[3] <- "eta"
+# Join datasets
+plot_data <- rbind.data.frame(pd1, pd2, pd3, pd4, pd5)
+# Converty ETA to factor
+plot_data$eta <- as.factor(plot_data$eta)
+# Plot points
+g_6 <- ggplot(plot_data, aes(x = iter, y = test_rmse_mean, color = eta))+
+  geom_point(alpha = 0.5) +
+  theme_bw() + # Set theme
+  theme(panel.grid.major = element_blank(), # Remove grid
+        panel.grid.minor = element_blank(), # Remove grid
+        panel.border = element_blank(), # Remove grid
+        panel.background = element_blank()) + # Remove grid 
+  labs(x = "Number of Trees", title = "RMSE v Number of Trees",
+       y = "RMSE", color = "Learning \n Rate")  # Set labels
+g_6
+
+# Plot lines
+g_7 <- ggplot(plot_data, aes(x = iter, y = test_rmse_mean, color = eta))+
+  geom_smooth(alpha = 0.5) +
+  theme_bw() + # Set theme
+  theme(panel.grid.major = element_blank(), # Remove grid
+        panel.grid.minor = element_blank(), # Remove grid
+        panel.border = element_blank(), # Remove grid
+        panel.background = element_blank()) + # Remove grid 
+  labs(x = "Number of Trees", title = "RMSE v Number of Trees",
+       y = "RMSE", color = "Learning \n Rate")  # Set labels
+g_7
+```
+The eta that minimizes RMSE is 0.1 and 0.05. 0.1 outperform 0.05, so we will choose that as the parameter value. Moreover, we can see that after nround 200 it is no longer improving, hence that will be the nroudds used
+
+```{r}
+
+###### Tune max depth and min child weight ######
+
+
+# Be Careful - This can take a very long time to run
+max_depth_vals <- c(3, 5, 7, 10, 15) # Create vector of max depth values
+min_child_weight <- c(1,3,5,7, 10, 15) # Create vector of min child values
+
+# Expand grid of parameter values
+cv_params <- expand.grid(max_depth_vals, min_child_weight)
+names(cv_params) <- c("max_depth", "min_child_weight")
+# Create results vector
+rmse_vec  <- rep(NA, nrow(cv_params)) 
+# Loop through results
+for(i in 1:nrow(cv_params)){
+  set.seed(111111)
+  bst_tune <- xgb.cv(data = dtrain, # Set training data
+                     
+                     nfold = 5, # Use 5 fold cross-validation
+                     
+                     eta = 0.01, # Set learning rate
+                     max.depth = cv_params$max_depth[i], # Set max depth
+                     min_child_weight = cv_params$min_child_weight[i], # Set minimum number of samples in node to split
+       
+                     nrounds = 500, # Set number of rounds
+                     early_stopping_rounds = 50, # Set number of rounds to stop at if there is no improvement
+                     
+                     verbose = 1, # 1 - Prints out fit
+                     nthread = 1, # Set number of parallel threads
+                     print_every_n = 20 # Prints out result every 20th iteration
+                     
+  ) # Set evaluation metric to use
+  
+  rmse_vec[i] <- bst_tune$evaluation_log$test_rmse_mean[bst_tune$best_ntreelimit]
+}
+
+```
+
+```{r}
+# Join results in dataset
+res_db <- cbind.data.frame(cv_params, rmse_vec)
+names(res_db)[3] <- c("rmse") 
+res_db$max_depth <- as.factor(res_db$max_depth) # Convert tree number to factor for plotting
+res_db$min_child_weight <- as.factor(res_db$min_child_weight) # Convert node size to factor for plotting
+# Print AUC heatmap
+g_2 <- ggplot(res_db, aes(y = max_depth, x = min_child_weight, fill = rmse)) + # set aesthetics
+  geom_tile() + # Use geom_tile for heatmap
+  theme_bw() + # Set theme
+  scale_fill_gradient2(low = "blue", # Choose low color
+                       mid = "white", # Choose mid color
+                       high = "red", # Choose high color
+                       midpoint =mean(res_db$rmse), # Choose mid point
+                       space = "Lab", 
+                       na.value ="grey", # Choose NA value
+                       guide = "colourbar", # Set color bar
+                       aesthetics = "fill") + # Select aesthetics to apply
+  labs(x = "Minimum Child Weight", y = "Max Depth", fill = "RMSE") # Set labels
+g_2 # Generate plot
+
+
+```
+
+We want to minimize RMSE so we will choose min child weight = 15 and max depth = 3
+
+
+```{r}
+###### Gamma Tuning ######
+
+
+gamma_vals <- c(0, 0.05, 0.1, 0.15, 0.2) # Create vector of gamma values
+
+# Be Careful - This can take a very long time to run
+set.seed(111111)
+rmse_vec  <- rep(NA, length(gamma_vals))
+for(i in 1:length(gamma_vals)){
+  bst_tune <- xgb.cv(data = dtrain, # Set training data
+                     
+                     nfold = 5, # Use 5 fold cross-validation
+                     
+                     eta = 0.1, # Set learning rate
+                     max.depth = 3, # Set max depth
+                     min_child_weight = 15, # Set minimum number of samples in node to split
+                     gamma = gamma_vals[i], # Set minimum loss reduction for split
+                     
+                     
+                     
+                     nrounds = 500, # Set number of rounds
+                     early_stopping_rounds = 50, # Set number of rounds to stop at if there is no improvement
+                     
+                     verbose = 1, # 1 - Prints out fit
+                     nthread = 1, # Set number of parallel threads
+                     print_every_n = 20 # Prints out result every 20th iteration
+  ) # Set evaluation metric to use
+  
+  
+  rmse_vec[i] <- bst_tune$evaluation_log$test_rmse_mean[bst_tune$best_ntreelimit]
+  
+  
+}
+```
+
+
+```{r}
+# Lets view our results to identify the value of gamma to use:
+
+# Gamma results
+# Join gamma to values
+cbind.data.frame(gamma_vals, rmse_vec)
+```
+
+The gamma that minimized RMSE is 0.2. 
+
+```{r}
+###### Subsample and Column sample Tuning ######
+
+# Be Careful - This can take a very long time to run
+subsample <- c(0.6, 0.7, 0.8, 0.9, 1) # Create vector of subsample values
+colsample_by_tree <- c(0.6, 0.7, 0.8, 0.9, 1) # Create vector of col sample values
+
+# Expand grid of tuning parameters
+cv_params <- expand.grid(subsample, colsample_by_tree)
+names(cv_params) <- c("subsample", "colsample_by_tree")
+# Create vectors to store results
+rmse_vec <- rep(NA, nrow(cv_params)) 
+# Loop through parameter values
+for(i in 1:nrow(cv_params)){
+  set.seed(111111)
+  bst_tune <- xgb.cv(data = dtrain, # Set training data
+                     
+                     nfold = 5, # Use 5 fold cross-validation
+                     
+                     eta = 0.1, # Set learning rate
+                     max.depth = 3, # Set max depth
+                     min_child_weight = 15, # Set minimum number of samples in node to split
+                     gamma = 0.2, # Set minimum loss reduction for split
+                     subsample = cv_params$subsample[i], # Set proportion of training data to use in tree
+                     colsample_bytree = cv_params$colsample_by_tree[i], # Set number of variables to use in each tree
+                     
+                     nrounds = 500, # Set number of rounds
+                     early_stopping_rounds = 50, # Set number of rounds to stop at if there is no improvement
+                     
+                     verbose = 1, # 1 - Prints out fit
+                     nthread = 1, # Set number of parallel threads
+                     print_every_n = 20 # Prints out result every 20th iteration
+  ) # Set evaluation metric to use
+  
+  
+  rmse_vec[i] <- bst_tune$evaluation_log$test_rmse_mean[bst_tune$best_ntreelimit]
+  
+  
+}
+```
+
+
+```{r}
+# visualise tuning sample params
+
+res_db <- cbind.data.frame(cv_params, rmse_vec)
+names(res_db)[3] <- c("rmse") 
+res_db$subsample <- as.factor(res_db$subsample) # Convert tree number to factor for plotting
+res_db$colsample_by_tree <- as.factor(res_db$colsample_by_tree) # Convert node size to factor for plotting
+g_4 <- ggplot(res_db, aes(y = colsample_by_tree, x = subsample, fill = rmse)) + # set aesthetics
+  geom_tile() + # Use geom_tile for heatmap
+  theme_bw() + # Set theme
+  scale_fill_gradient2(low = "blue", # Choose low color
+                       mid = "white", # Choose mid color
+                       high = "red", # Choose high color
+                       midpoint =mean(res_db$rmse), # Choose mid point
+                       space = "Lab", 
+                       na.value ="grey", # Choose NA value
+                       guide = "colourbar", # Set color bar
+                       aesthetics = "fill") + # Select aesthetics to apply
+  labs(x = "Subsample", y = "Column Sample by Tree", fill = "RMSE") # Set labels
+g_4 # Generate plot
+```
+
+We minimize RMSE with subsample 0.8 and column sample of 1
+
+```{r}
+# fit final xgb model
+set.seed(111111)
+final_xgb_model <- xgboost(data = dtrain, # Set training data
+   
+                     eta = 0.1, # Set learning rate
+                     max.depth =  3, # Set max depth
+                     min_child_weight = 15, # Set minimum number of samples in node to split
+                     gamma = 0.2, # Set minimum loss reduction for split
+                     subsample =  0.8, # Set proportion of training data to use in tree
+                     colsample_bytree = 1, # Set number of variables to use in each tree
+                     
+                     nrounds = 200, # Set number of rounds
+                     early_stopping_rounds = 50, # Set number of rounds to stop at if there is no improvement
+                     
+                     verbose = 1, # 1 - Prints out fit
+                     nthread = 1, # Set number of parallel threads
+                     print_every_n = 20 # Prints out result every 20th iteration
+                     
+) 
+
+```
+
+```{r}
+
+# Make predictions on the test set
+xgboost_preds <- predict(final_xgb_model, dtest)  # If you have a separate test set, use it here
+  
+# Calculate RMSE
+rmse <- rmse(test_data$GrowthRate, xgboost_preds)
+rmse
+
+#the XGBoost outperform RandomForest and RMSE is lower
+
+```
+
+```{r}
+# Let us look at variable importnace
+# Extract importance
+imp_mat <- xgb.importance(model = final_xgb_model)
+# Plot importance (top 10 variables)
+xgb.plot.importance(imp_mat, top_n = 10)
+```
+
+```{r}
+# Calculate SHAP importance
+
+shap_result <- shap.score.rank(xgb_model = final_xgb_model,
+                X_train =x_train,
+                shap_approx = F)
+
+# Plot SHAP importance
+var_importance(shap_result, top_n=10)
+
+```
+As we see from both importance plots, the relevant metrics are very similar to what we saw before with Market Cap specially playing a big role. Moreover the standard deviation from the previous 8 weeks seems relevent with some more metrics like Return on Asset and Enterprise to EBITDA which speaks more on the company's activity
+
+## Result Analysis
+
+Based on RMSE we will choose XGBoost as the model to use
+
+```{r}
+#Let us compare the distribution of the predicted and actual values
+
+# Create a data frame for plotting
+df_for_plot <- data.frame(
+  value = c(test_data$GrowthRate, xgboost_preds),
+  type = rep(c("Actual", "Predicted"), each = length(test_data$GrowthRate))
+)
+# Create the density plot
+ggplot(df_for_plot, aes(x = value, fill = type)) +
+  geom_density(alpha = 0.4) +  # Adjust alpha for transparency
+  scale_fill_manual(values = c("Actual" = "blue", "Predicted" = "red")) +  # Colors for the densities
+  theme_minimal() +
+  labs(title = "Density Plot of Actual and Predicted Values",
+       x = "Values", 
+       y = "Density",
+       fill = "Type")
+
+```
+
+The model seems to have more stable predictions than the actual values. It is more conservative on when predicint growth values with most values lying in the middle and having few outliers. Unfortunately, it did not seem to be able to predict the outliers super well which is the main goal
+
+```{r}
+# Create scatter plot of actual vs predicted
+ggplot(data.frame(Actual = test_data$GrowthRate, Predicted = xgboost_preds), aes(x = Actual, y = Predicted)) +
+  geom_point(color = "darkgreen", alpha = 0.6) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "red") +  # 45-degree line
+  theme_minimal() +
+  labs(title = "Actual vs Predicted Values",
+       x = "Actual Values",
+       y = "Predicted Values")
+```
+
+From this plot we see that the model struggles with outliers, specially with the stocks with negative growth rate, in which, most values are predicted to have a higher growth rate than in reality. However, most value lie around the slightly positive range where there is no strong pattern on whether most values are under or over valued.
+
+
+```{r}
+# Let us look into the residual values
+
+# Calculate residuals
+residuals <- test_data$GrowthRate - xgboost_preds
+
+# Create residual plot
+ggplot(data.frame(Predicted = xgboost_preds, Residuals = residuals), aes(x = Predicted, y = Residuals)) +
+  geom_point(color = "blue") +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "red") +
+  theme_minimal() +
+  labs(title = "Residual Plot",
+       x = "Predicted Values",
+       y = "Residuals (Actual - Predicted)")
+
+```
+
+There does not seems to be a relevant pattern on the predicted values. Most are concentrated in the middle as it is where most observations lie and the variation seems somewhat consistent
+
+
+```{r}
+#Let's compare what stocks the model would choose vs the actual best performing stocks
+
+#dtest will know be the entire dataset
+all_stock_info_pred <- all_stock_info[,-c(1, 22)]
+
+x_test <- as.matrix(all_stock_info_pred[, -which(names(all_stock_info_pred) == "GrowthRate")]) # Exclude the target column
+y_test <- all_stock_info$GrowthRate
+
+# Convert the data to DMatrix format
+dtest <- xgb.DMatrix(data = x_test, label = y_test)
+
+# Prediction
+predicted_growthrate <- predict(final_xgb_model, dtest)
+```
+
+```{r}
+# Add prediction values to table
+stock_info_with_pred <- unmodified_stock_info
+stock_info_with_pred$Predicted.GrowthRate <- predicted_growthrate
+
+#Top 10 based on prediction
+top_10_pred <- stock_info_with_pred[order(-stock_info_with_pred$Predicted.GrowthRate), ][1:10, ]
+top_10_pred[,c("Ticker","longName", "GrowthRate", "Predicted.GrowthRate")]
+
+#Top 10 based on actual value
+top_10_act <- stock_info_with_pred[order(-stock_info_with_pred$GrowthRate), ][1:15, ]
+top_10_act[,c("Ticker","longName", "GrowthRate", "Predicted.GrowthRate")]
+```
+
+Wow! Only three stocks are different between the actual and predicted top 10, PLTR, VNO and THC, all other are in the top 10 but with different ranking. This shows that although the rates are different, the model is still able to filter and identify the ones that grow the most. With this we would be able to at least choose what stocks to invest, it might not be wise to use to distribute what exactly amount to go to each stock, but to act more as a filter.
+
+
+In conclusion, growth rate are somewhat predictable given financial information of the company, but it is evident which stocks will have a good growth rate, even if the that rate is not exactly as calculated.  For comparison the SP500 growth rate in 10 weeks (in the same time frame used) was 8.6%, while the model was able to correctly identify stock with far higher growth. This would indicate that markets are not efficient. The next step is to test the model versus people and a fish in choosing stock. Depending the winner, we would be able to tell if stocks are random or if predictable
+
+
+

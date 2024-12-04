@@ -1,4 +1,4 @@
-Readme For Stock Growth Rate Prediction
+Stock Growth Rate Prediction
 ================
 
 ## GitHub Documents
